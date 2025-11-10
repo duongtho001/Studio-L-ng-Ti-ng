@@ -1,0 +1,5 @@
+{
+  "name": "Voice Over Studio",
+  "description": "An application to generate multi-speaker voice-overs from a text file. Upload a script, assign distinct voices to each character, and generate, preview, and download the final audio.",
+  "requestFramePermissions": []
+}
