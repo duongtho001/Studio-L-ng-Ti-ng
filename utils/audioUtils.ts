@@ -1,4 +1,3 @@
-
 /**
  * Decodes a Base64 string into a Uint8Array.
  * @param base64 The Base64 encoded string.
@@ -13,6 +12,35 @@ export function decodeBase64(base64: string): Uint8Array {
   }
   return bytes;
 }
+
+/**
+ * Decodes raw PCM audio data into an AudioBuffer for playback with the Web Audio API.
+ * @param data The raw PCM data (16-bit signed integers).
+ * @param ctx The AudioContext to use for creating the buffer.
+ * @param sampleRate The sample rate of the audio.
+ * @param numChannels The number of audio channels.
+ * @returns A promise that resolves with the decoded AudioBuffer.
+ */
+export async function decodeAudioData(
+  data: Uint8Array,
+  ctx: AudioContext,
+  sampleRate: number,
+  numChannels: number,
+): Promise<AudioBuffer> {
+  const dataInt16 = new Int16Array(data.buffer, data.byteOffset, data.byteLength / 2);
+  const frameCount = dataInt16.length / numChannels;
+  const buffer = ctx.createBuffer(numChannels, frameCount, sampleRate);
+
+  for (let channel = 0; channel < numChannels; channel++) {
+    const channelData = buffer.getChannelData(channel);
+    for (let i = 0; i < frameCount; i++) {
+      // Normalize the 16-bit signed integer to a float between -1.0 and 1.0
+      channelData[i] = dataInt16[i * numChannels + channel] / 32768.0;
+    }
+  }
+  return buffer;
+}
+
 
 interface WavOptions {
   numChannels?: number;

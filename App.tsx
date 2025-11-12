@@ -1,4 +1,3 @@
-
 import React, { useState, useCallback, useMemo, useRef, useEffect } from 'react';
 import { GoogleGenAI, Modality, Type } from '@google/genai';
 import type { MultiSpeakerVoiceConfig } from '@google/genai';
@@ -11,11 +10,14 @@ import { NARRATOR_KEY, DEFAULT_FEMALE_VOICE, DEFAULT_MALE_VOICE, DEFAULT_NEUTRAL
 import { createWavBlob, decodeBase64 } from './utils/audioUtils';
 import { chunkTextBySentences } from './utils/textUtils';
 import { StudioIcon } from './components/icons/StudioIcon';
+import { TrashIcon } from './components/icons/TrashIcon';
+import { PlayIcon } from './components/icons/PlayIcon';
 
 export default function App() {
   const [apiKeysString, setApiKeysString] = useState<string>(() => localStorage.getItem('gemini-api-keys') || '');
   const [jobs, setJobs] = useState<Job[]>([]);
   const [isQueueProcessing, setIsQueueProcessing] = useState<boolean>(false);
+  const [isQueuePaused, setIsQueuePaused] = useState<boolean>(false);
   const [editingJob, setEditingJob] = useState<Job | null>(null);
 
   const apiKeys = useMemo(() => apiKeysString.split('\n').filter(k => k.trim() !== ''), [apiKeysString]);
@@ -26,6 +28,11 @@ export default function App() {
     jobsRef.current = jobs;
   }, [jobs]);
 
+  const isQueuePausedRef = useRef(isQueuePaused);
+  useEffect(() => {
+    isQueuePausedRef.current = isQueuePaused;
+  }, [isQueuePaused]);
+
   useEffect(() => {
     if (apiKeysString) {
       localStorage.setItem('gemini-api-keys', apiKeysString);
@@ -34,18 +41,14 @@ export default function App() {
     }
   }, [apiKeysString]);
 
-  // FIX: Use a standard function expression for the generic async callback to avoid TSX parsing issues.
   const withApiKeyRotation = useCallback(async function<T>(apiCall: (apiKey: string) => Promise<T>): Promise<T> {
     if (apiKeys.length === 0) {
       throw new Error("Vui lòng cung cấp ít nhất một API Key.");
     }
-
     let lastError: any = null;
-
     for (let i = 0; i < apiKeys.length; i++) {
       const keyIndex = (currentApiKeyIndexRef.current + i) % apiKeys.length;
       const currentKey = apiKeys[keyIndex];
-
       try {
         const result = await apiCall(currentKey);
         currentApiKeyIndexRef.current = keyIndex;
@@ -56,7 +59,7 @@ export default function App() {
         if (isRateLimitError) {
           console.warn(`API key at index ${keyIndex} failed. Trying next key.`);
         } else {
-          throw e; // Non-retryable error
+          throw e;
         }
       }
     }
@@ -65,14 +68,12 @@ export default function App() {
 
   const detectCharactersAndGenders = useCallback(async (job: Job) => {
     const initialMap: CharacterMap = { [NARRATOR_KEY]: { voice: DEFAULT_NEUTRAL_VOICE } };
-
     try {
       const detectedCharacters: { name: string, gender: string }[] = await withApiKeyRotation(async (key) => {
         const ai = new GoogleGenAI({ apiKey: key });
         const prompt = `Please read the following script, identify all unique character names (excluding "${NARRATOR_KEY}"), and determine their likely gender (must be "Male", "Female", or "Neutral"). Return the result as a single JSON array of objects, where each object has a "name" and "gender" property. If no characters are found, return an empty array.
 
 Script: """${job.fileContent}"""`;
-
         const responseSchema = {
           type: Type.ARRAY,
           items: {
@@ -84,7 +85,6 @@ Script: """${job.fileContent}"""`;
             required: ['name', 'gender']
           }
         };
-
         const response = await ai.models.generateContent({
           model: "gemini-2.5-flash",
           contents: [{ parts: [{ text: prompt }] }],
@@ -95,22 +95,18 @@ Script: """${job.fileContent}"""`;
         });
         return JSON.parse(response.text);
       });
-
       detectedCharacters.forEach(char => {
         if (char.name && char.name.toLowerCase() !== NARRATOR_KEY.toLowerCase()) {
           const gender = char.gender;
           initialMap[char.name] = { voice: gender === 'Male' ? DEFAULT_MALE_VOICE : gender === 'Female' ? DEFAULT_FEMALE_VOICE : DEFAULT_NEUTRAL_VOICE };
         }
       });
-
       setJobs(prev => prev.map(j => j.id === job.id ? { ...j, characterMap: initialMap, status: 'queued' } : j));
-
     } catch (e: any) {
       console.error("Failed to detect characters and genders:", e);
       const errorMessage = e.message?.includes('RESOURCE_EXHAUSTED')
         ? "Lỗi: Tất cả các API key đều đã hết hạn mức hoặc không hợp lệ."
         : "Không thể tự động phát hiện nhân vật. Vui lòng thêm thủ công.";
-      
       setJobs(prev => prev.map(j => j.id === job.id ? { ...j, characterMap: initialMap, status: 'failed', error: errorMessage } : j));
     }
   }, [withApiKeyRotation]);
@@ -124,8 +120,6 @@ Script: """${job.fileContent}"""`;
       characterMap: {},
     }));
     setJobs(prevJobs => [...prevJobs, ...newJobs]);
-    
-    // Process detection sequentially to avoid rate limiting on startup
     (async () => {
       for (const newJob of newJobs) {
         await detectCharactersAndGenders(newJob);
@@ -133,72 +127,109 @@ Script: """${job.fileContent}"""`;
     })();
   }, [detectCharactersAndGenders]);
 
-  const processQueue = async () => {
-    setIsQueueProcessing(true);
-    const jobIdsToProcess = jobsRef.current.filter(j => j.status === 'queued').map(j => j.id);
+  const generateAudioForJob = async (jobId: number) => {
+    setJobs(prev => prev.map(j => j.id === jobId ? { ...j, status: 'processing', progressMessage: 'Chuẩn bị tạo...' } : j));
+    try {
+      const job = jobsRef.current.find(j => j.id === jobId);
+      if (!job) throw new Error("Không tìm thấy công việc.");
 
-    for (const jobId of jobIdsToProcess) {
-      setJobs(prev => prev.map(j => j.id === jobId ? { ...j, status: 'processing', progressMessage: 'Chuẩn bị tạo...' } : j));
-
-      try {
-        const job = jobsRef.current.find(j => j.id === jobId);
-        if (!job) throw new Error("Không tìm thấy công việc.");
-
-        const speakers = Object.keys(job.characterMap).filter(c => c !== NARRATOR_KEY);
-        if (speakers.length > 2) {
-          throw new Error("Chỉ hỗ trợ tối đa hai nhân vật nói.");
-        }
-        
-        const chunks = chunkTextBySentences(job.fileContent);
-        const allPcmData: Uint8Array[] = [];
-
-        for (let i = 0; i < chunks.length; i++) {
-          setJobs(prev => prev.map(j => j.id === jobId ? { ...j, progressMessage: `Đang tạo phân đoạn ${i + 1}/${chunks.length}...` } : j));
-
-          const currentJobForApi = jobsRef.current.find(j => j.id === jobId);
-          if (!currentJobForApi) throw new Error("Job disappeared during API call");
-
-          const response = await withApiKeyRotation(async (key) => {
-            const ai = new GoogleGenAI({ apiKey: key });
-            if (speakers.length === 2) {
-              const speakerVoiceConfigs: MultiSpeakerVoiceConfig['speakerVoiceConfigs'] = speakers.map(speaker => ({ speaker, voiceConfig: { prebuiltVoiceConfig: { voiceName: currentJobForApi.characterMap[speaker].voice } } }));
-              return await ai.models.generateContent({ model: "gemini-2.5-flash-preview-tts", contents: [{ parts: [{ text: `TTS đoạn hội thoại sau giữa ${speakers.join(' và ')}:\n\n${chunks[i]}` }] }], config: { responseModalities: [Modality.AUDIO], speechConfig: { multiSpeakerVoiceConfig: { speakerVoiceConfigs } } } });
-            } else {
-              const primarySpeaker = speakers.length === 1 ? speakers[0] : NARRATOR_KEY;
-              const voice = currentJobForApi.characterMap[primarySpeaker]?.voice || DEFAULT_NEUTRAL_VOICE;
-              return await ai.models.generateContent({ model: "gemini-2.5-flash-preview-tts", contents: [{ parts: [{ text: `TTS đoạn văn bản sau:\n\n${chunks[i]}` }] }], config: { responseModalities: [Modality.AUDIO], speechConfig: { voiceConfig: { prebuiltVoiceConfig: { voiceName: voice } } } } });
-            }
-          });
-
-          const base64Audio = response.candidates?.[0]?.content?.parts?.[0]?.inlineData?.data;
-          if (base64Audio) allPcmData.push(decodeBase64(base64Audio));
-        }
-
-        if (allPcmData.length === 0) throw new Error("Không thể tạo dữ liệu âm thanh.");
-        
-        setJobs(prev => prev.map(j => j.id === jobId ? { ...j, progressMessage: 'Đang ghép âm thanh...' } : j));
-        const totalLength = allPcmData.reduce((acc, val) => acc + val.length, 0);
-        const combinedPcmData = new Uint8Array(totalLength);
-        let offset = 0;
-        for (const pcm of allPcmData) {
-          combinedPcmData.set(pcm, offset);
-          offset += pcm.length;
-        }
-        
-        const wavBlob = createWavBlob(combinedPcmData, { sampleRate: 24000, numChannels: 1 });
-        const url = URL.createObjectURL(wavBlob);
-        setJobs(prev => prev.map(j => j.id === jobId ? { ...j, status: 'completed', audioUrl: url, progressMessage: '' } : j));
-
-      } catch (e: any) {
-        console.error(e);
-        let errorMessage = `Tạo thất bại: ${e.message}`;
-        if (e.message?.includes('RESOURCE_EXHAUSTED')) {
-          errorMessage = "Lỗi: Tất cả các API key đều đã hết hạn mức hoặc không hợp lệ. Vui lòng kiểm tra lại key và hạn mức của bạn.";
-        }
-        setJobs(prev => prev.map(j => j.id === jobId ? { ...j, status: 'failed', error: errorMessage, progressMessage: '' } : j));
+      const speakers = Object.keys(job.characterMap).filter(c => c !== NARRATOR_KEY);
+      if (speakers.length > 2) {
+        throw new Error("Chỉ hỗ trợ tối đa hai nhân vật nói.");
       }
+
+      const chunks = chunkTextBySentences(job.fileContent);
+      const allPcmData: Uint8Array[] = [];
+
+      for (let i = 0; i < chunks.length; i++) {
+        setJobs(prev => prev.map(j => j.id === jobId ? { ...j, progressMessage: `Đang tạo phân đoạn ${i + 1}/${chunks.length}...` } : j));
+
+        const currentJobForApi = jobsRef.current.find(j => j.id === jobId);
+        if (!currentJobForApi) throw new Error("Job disappeared during API call");
+
+        const response = await withApiKeyRotation(async (key) => {
+          const ai = new GoogleGenAI({ apiKey: key });
+          if (speakers.length === 2) {
+            const speakerVoiceConfigs: MultiSpeakerVoiceConfig['speakerVoiceConfigs'] = speakers.map(speaker => ({ speaker, voiceConfig: { prebuiltVoiceConfig: { voiceName: currentJobForApi.characterMap[speaker].voice } } }));
+            return await ai.models.generateContent({ model: "gemini-2.5-flash-preview-tts", contents: [{ parts: [{ text: `TTS đoạn hội thoại sau giữa ${speakers.join(' và ')}:\n\n${chunks[i]}` }] }], config: { responseModalities: [Modality.AUDIO], speechConfig: { multiSpeakerVoiceConfig: { speakerVoiceConfigs } } } });
+          } else {
+            const primarySpeaker = speakers.length === 1 ? speakers[0] : NARRATOR_KEY;
+            const voice = currentJobForApi.characterMap[primarySpeaker]?.voice || DEFAULT_NEUTRAL_VOICE;
+            return await ai.models.generateContent({ model: "gemini-2.5-flash-preview-tts", contents: [{ parts: [{ text: `TTS đoạn văn bản sau:\n\n${chunks[i]}` }] }], config: { responseModalities: [Modality.AUDIO], speechConfig: { voiceConfig: { prebuiltVoiceConfig: { voiceName: voice } } } } });
+          }
+        });
+
+        const base64Audio = response.candidates?.[0]?.content?.parts?.[0]?.inlineData?.data;
+        if (base64Audio) allPcmData.push(decodeBase64(base64Audio));
+      }
+
+      if (allPcmData.length === 0) throw new Error("Không thể tạo dữ liệu âm thanh.");
+      
+      setJobs(prev => prev.map(j => j.id === jobId ? { ...j, progressMessage: 'Đang ghép âm thanh...' } : j));
+      const totalLength = allPcmData.reduce((acc, val) => acc + val.length, 0);
+      const combinedPcmData = new Uint8Array(totalLength);
+      let offset = 0;
+      for (const pcm of allPcmData) {
+        combinedPcmData.set(pcm, offset);
+        offset += pcm.length;
+      }
+      
+      const wavBlob = createWavBlob(combinedPcmData, { sampleRate: 24000, numChannels: 1 });
+      const url = URL.createObjectURL(wavBlob);
+      setJobs(prev => prev.map(j => j.id === jobId ? { ...j, status: 'completed', audioUrl: url, progressMessage: '' } : j));
+    } catch (e: any) {
+      console.error(e);
+      let errorMessage = `Tạo thất bại: ${e.message}`;
+      if (e.message?.includes('RESOURCE_EXHAUSTED')) {
+        errorMessage = "Lỗi: Tất cả các API key đều đã hết hạn mức hoặc không hợp lệ. Vui lòng kiểm tra lại key và hạn mức của bạn.";
+      }
+      setJobs(prev => prev.map(j => j.id === jobId ? { ...j, status: 'failed', error: errorMessage, progressMessage: '' } : j));
+    }
+  };
+
+  const processQueue = async () => {
+    if (isQueueProcessing && !isQueuePaused) return;
+
+    setIsQueueProcessing(true);
+    setIsQueuePaused(false);
+
+    // Give state a moment to update so isQueuePausedRef is correct
+    await new Promise(resolve => setTimeout(resolve, 0));
+
+    const jobIdsToProcess = jobsRef.current.filter(j => j.status === 'queued').map(j => j.id);
+    for (const jobId of jobIdsToProcess) {
+      if (isQueuePausedRef.current) {
+        return;
+      }
+      await generateAudioForJob(jobId);
     }
     setIsQueueProcessing(false);
+    setIsQueuePaused(false);
+  };
+
+  const processSingleJob = async (jobId: number) => {
+    if (isQueueProcessing) return;
+    setIsQueueProcessing(true);
+    await generateAudioForJob(jobId);
+    setIsQueueProcessing(false);
+  };
+  
+  const handlePauseResumeQueue = () => {
+    if (isQueueProcessing) {
+      setIsQueuePaused(prev => !prev);
+      if (isQueuePaused) {
+        // We are resuming, so call processQueue
+        processQueue();
+      }
+    }
+  };
+
+  const handleDeleteJob = (jobId: number) => {
+    const jobToDelete = jobs.find(j => j.id === jobId);
+    if (jobToDelete?.audioUrl) {
+      URL.revokeObjectURL(jobToDelete.audioUrl);
+    }
+    setJobs(prev => prev.filter(j => j.id !== jobId));
   };
 
   const handleUpdateEditingJob = (updatedMap: CharacterMap) => {
@@ -213,7 +244,7 @@ Script: """${job.fileContent}"""`;
   };
 
   const queuedJobsCount = useMemo(() => jobs.filter(j => j.status === 'queued').length, [jobs]);
-  const isGenerateDisabled = apiKeys.length === 0 || queuedJobsCount === 0 || isQueueProcessing;
+  const isGenerateDisabled = apiKeys.length === 0 || (queuedJobsCount === 0 && !isQueueProcessing);
 
   const getStatusPill = (status: Job['status']) => {
     const styles: {[key: string]: string} = {
@@ -231,6 +262,28 @@ Script: """${job.fileContent}"""`;
       failed: 'Thất bại',
     };
     return <span className={`px-2 py-1 text-xs font-medium rounded-full ${styles[status]}`}>{text[status]}</span>;
+  };
+
+  const renderMainButton = () => {
+    if (isQueueProcessing && !isQueuePaused) {
+      return (
+        <button onClick={handlePauseResumeQueue} className="w-full py-3 px-4 rounded-lg font-semibold text-white transition-all duration-300 flex items-center justify-center gap-2 bg-gradient-to-r from-yellow-600 to-orange-600 hover:from-yellow-500 hover:to-orange-500">
+          <Loader /> Tạm dừng
+        </button>
+      );
+    }
+    if (isQueueProcessing && isQueuePaused) {
+      return (
+        <button onClick={handlePauseResumeQueue} className="w-full py-3 px-4 rounded-lg font-semibold text-white transition-all duration-300 flex items-center justify-center gap-2 bg-gradient-to-r from-green-600 to-teal-600 hover:from-green-500 hover:to-teal-500">
+          Tiếp tục ({queuedJobsCount} tệp)
+        </button>
+      );
+    }
+    return (
+       <button onClick={processQueue} disabled={isGenerateDisabled} className={`w-full py-3 px-4 rounded-lg font-semibold text-white transition-all duration-300 flex items-center justify-center gap-2 ${isGenerateDisabled ? 'bg-indigo-900/50 cursor-not-allowed text-gray-400' : 'bg-gradient-to-r from-purple-600 to-indigo-600 hover:from-purple-500 hover:to-indigo-500 shadow-md hover:shadow-lg transform hover:-translate-y-0.5'}`}>
+          Bắt đầu tạo ({queuedJobsCount} tệp)
+        </button>
+    );
   };
 
   return (
@@ -252,7 +305,6 @@ Script: """${job.fileContent}"""`;
           </header>
 
           <main className="grid grid-cols-1 lg:grid-cols-5 gap-8">
-            {/* Left Column: Controls */}
             <div className="lg:col-span-2 bg-gray-800/50 rounded-xl p-6 shadow-lg border border-gray-700 flex flex-col gap-6 self-start">
               <div>
                 <h2 className="text-2xl font-semibold mb-2 text-indigo-300">Quản lý API Keys</h2>
@@ -271,19 +323,9 @@ Script: """${job.fileContent}"""`;
 
               <FileUpload onFilesSelect={handleFilesSelect} disabled={apiKeys.length === 0} />
 
-              <button
-                onClick={processQueue}
-                disabled={isGenerateDisabled}
-                className={`w-full py-3 px-4 rounded-lg font-semibold text-white transition-all duration-300 flex items-center justify-center gap-2
-                  ${isGenerateDisabled
-                    ? 'bg-indigo-900/50 cursor-not-allowed text-gray-400'
-                    : 'bg-gradient-to-r from-purple-600 to-indigo-600 hover:from-purple-500 hover:to-indigo-500 shadow-md hover:shadow-lg transform hover:-translate-y-0.5'}`}
-              >
-                {isQueueProcessing ? <><Loader /> Đang xử lý hàng chờ...</> : `Bắt đầu tạo (${queuedJobsCount} tệp)`}
-              </button>
+              {renderMainButton()}
             </div>
 
-            {/* Right Column: Queue & History */}
             <div className="lg:col-span-3 bg-gray-800/50 rounded-xl p-6 shadow-lg border border-gray-700 flex flex-col">
               <h2 className="text-2xl font-semibold mb-4 text-indigo-300">Hàng chờ & Lịch sử</h2>
               <div className="space-y-4 max-h-[70vh] overflow-y-auto pr-2">
@@ -294,8 +336,8 @@ Script: """${job.fileContent}"""`;
                 ) : (
                   [...jobs].reverse().map(job => (
                     <div key={job.id} className="bg-gray-900/50 p-4 rounded-lg border border-gray-700">
-                      <div className="flex justify-between items-center mb-2">
-                        <p className="font-bold truncate pr-4" title={job.fileName}>{job.fileName}</p>
+                      <div className="flex justify-between items-start mb-2">
+                        <p className="font-bold truncate pr-4 break-all" title={job.fileName}>{job.fileName}</p>
                         {getStatusPill(job.status)}
                       </div>
                       
@@ -307,22 +349,43 @@ Script: """${job.fileContent}"""`;
                       )}
 
                       {job.status === 'completed' && job.audioUrl && (
-                        <AudioPlayer audioUrl={job.audioUrl} fileName={job.fileName.replace('.txt', '.wav')} />
-                      )}
-
-                      {job.error && <p className="text-sm text-red-400 mt-2">{job.error}</p>}
-                      
-                      {(job.status === 'queued' || job.status === 'failed') && (
                         <div className="mt-2">
-                          <button 
-                            onClick={() => setEditingJob(job)}
-                            className="text-sm text-indigo-400 hover:text-indigo-300 font-semibold"
-                            disabled={isQueueProcessing}
-                          >
-                            Chỉnh sửa giọng nói
-                          </button>
+                          <AudioPlayer audioUrl={job.audioUrl} fileName={job.fileName.replace('.txt', '.wav')} />
                         </div>
                       )}
+
+                      {job.error && <p className="text-sm text-red-400 mt-2 break-words">{job.error}</p>}
+                      
+                      <div className="flex items-center justify-between mt-3 pt-3 border-t border-gray-700/50">
+                        <div className="flex items-center gap-4">
+                           {(job.status === 'queued' || job.status === 'failed') && (
+                            <button 
+                              onClick={() => setEditingJob(job)}
+                              className="text-sm text-indigo-400 hover:text-indigo-300 font-semibold disabled:text-gray-500 disabled:cursor-not-allowed"
+                              disabled={isQueueProcessing}
+                            >
+                              Chỉnh sửa giọng nói
+                            </button>
+                          )}
+                          {job.status === 'queued' && (
+                            <button
+                              onClick={() => processSingleJob(job.id)}
+                              className="text-sm text-green-400 hover:text-green-300 font-semibold disabled:text-gray-500 disabled:cursor-not-allowed flex items-center gap-1"
+                              disabled={isQueueProcessing}
+                            >
+                              <PlayIcon className="w-4 h-4" /> Tạo ngay
+                            </button>
+                          )}
+                        </div>
+                        <button
+                          onClick={() => handleDeleteJob(job.id)}
+                          className="p-2 rounded-full hover:bg-gray-700 disabled:opacity-50 disabled:cursor-not-allowed transition-colors"
+                          aria-label={`Xóa tệp ${job.fileName}`}
+                          disabled={job.status === 'processing'}
+                        >
+                          <TrashIcon className="w-5 h-5 text-gray-400 hover:text-red-400" />
+                        </button>
+                      </div>
                     </div>
                   ))
                 )}
@@ -332,7 +395,6 @@ Script: """${job.fileContent}"""`;
         </div>
       </div>
       
-      {/* Edit Modal */}
       {editingJob && (
         <div className="fixed inset-0 bg-black/60 flex items-center justify-center p-4 z-50 backdrop-blur-sm" onClick={() => setEditingJob(null)}>
           <div className="bg-gray-800 rounded-xl shadow-2xl border border-gray-700 w-full max-w-2xl max-h-[90vh] flex flex-col" onClick={e => e.stopPropagation()}>
@@ -355,7 +417,7 @@ Script: """${job.fileContent}"""`;
                     delete newMap[name];
                     handleUpdateEditingJob(newMap);
                   }}
-                  isDetectingGenders={false} // Detection is done before
+                  isDetectingGenders={false}
                   withApiKeyRotation={withApiKeyRotation}
                 />
             </div>
