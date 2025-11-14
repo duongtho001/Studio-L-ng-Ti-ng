@@ -48,6 +48,8 @@ const RUSSIA_VOICES: Voice[] = [CHARON_DEEP, FENRIR_DEEP];
 const KOREA_VOICES: Voice[] = [KORE, PUCK];
 const JAPAN_VOICES: Voice[] = [ZEPHYR, PUCK];
 const CHINA_VOICES: Voice[] = [KORE, CHARON_SERIOUS];
+const PORTUGAL_VOICES: Voice[] = [KORE, PUCK];
+const SPAIN_VOICES: Voice[] = [ZEPHYR, CHARON_GENERIC];
 
 
 export const COUNTRY_VOICES: VoiceCategory = {
@@ -59,6 +61,8 @@ export const COUNTRY_VOICES: VoiceCategory = {
   "Hàn Quốc (Korea)": KOREA_VOICES,
   "Nhật Bản (Japan)": JAPAN_VOICES,
   "Trung Quốc (China)": CHINA_VOICES,
+  "Bồ Đào Nha (Portugal)": PORTUGAL_VOICES,
+  "Tây Ban Nha (Spain)": SPAIN_VOICES,
 };
 
 export const THEME_VOICES: VoiceCategory = {
